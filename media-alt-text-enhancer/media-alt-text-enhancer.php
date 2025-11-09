@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Media Alt Text Enhancer
  * Description: Scans media library for images without alt text, generates descriptions using OpenAI vision models, and updates the alt attribute automatically.
- * Version: 1.0.1
+ * Version: 1.0.0
  * Author: OpenAI Assistant
  * License: GPL2
  * Text Domain: media-alt-text-enhancer
@@ -17,8 +17,6 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
     {
         private const OPTION_KEY = 'media_alt_text_enhancer_settings';
         private const NONCE_ACTION = 'media_alt_text_enhancer_generate';
-        private const MAX_ALT_LENGTH = 120;
-        private const OPENAI_ENDPOINT = 'https://api.openai.com/v1/chat/completions';
 
         public function __construct()
         {
@@ -197,7 +195,7 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 'media-alt-text-enhancer'
             ) . '</p>';
 
-            echo '<form method="post">';
+            printf('<form method="post">');
             wp_nonce_field(self::NONCE_ACTION);
             submit_button(__('Generate Alt Text Now', 'media-alt-text-enhancer'), 'primary', 'media_alt_text_enhancer_generate');
             echo '</form>';
@@ -249,15 +247,12 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             }
 
             $attachments = get_posts([
-                'post_type'           => 'attachment',
-                'post_mime_type'      => 'image',
-                'posts_per_page'      => -1,
-                'post_status'         => 'inherit',
-                'fields'              => 'ids',
-                'no_found_rows'       => true,
-                'update_post_meta_cache' => false,
-                'update_post_term_cache' => false,
-                'meta_query'          => [
+                'post_type'      => 'attachment',
+                'post_mime_type' => 'image',
+                'posts_per_page' => -1,
+                'post_status'    => 'inherit',
+                'fields'         => 'ids',
+                'meta_query'     => [
                     'relation' => 'OR',
                     [
                         'key'     => '_wp_attachment_image_alt',
@@ -278,8 +273,6 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             ];
 
             foreach ($attachments as $attachment_id) {
-                $attachment_id = intval($attachment_id);
-
                 $alt = get_post_meta($attachment_id, '_wp_attachment_image_alt', true);
                 if ('' !== trim((string) $alt)) {
                     $results['skipped']++;
@@ -313,20 +306,20 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
         private function generate_alt_text_for_attachment(int $attachment_id, array $settings)
         {
             $image_url = wp_get_attachment_url($attachment_id);
-            if (! $image_url || ! wp_http_validate_url($image_url)) {
-                return new WP_Error('missing_url', __('Unable to determine a valid image URL.', 'media-alt-text-enhancer'));
+            if (! $image_url) {
+                return new WP_Error('missing_url', __('Unable to determine image URL.', 'media-alt-text-enhancer'));
             }
 
             $request_body = $this->build_openai_request_body($image_url, $settings['language'] ?? 'en');
 
-            $response = wp_safe_remote_post(
-                self::OPENAI_ENDPOINT,
+            $response = wp_remote_post(
+                'https://api.openai.com/v1/chat/completions',
                 [
                     'headers' => [
                         'Content-Type'  => 'application/json',
                         'Authorization' => 'Bearer ' . $settings['api_key'],
                     ],
-                    'body'    => wp_json_encode($request_body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                    'body'    => wp_json_encode($request_body),
                     'timeout' => 60,
                 ]
             );
@@ -337,15 +330,10 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
 
             $code = wp_remote_retrieve_response_code($response);
             if ($code < 200 || $code >= 300) {
-                $message = wp_remote_retrieve_response_message($response);
-                return new WP_Error(
-                    'http_error',
-                    sprintf(
-                        __('OpenAI API returned HTTP %1$d %2$s.', 'media-alt-text-enhancer'),
-                        intval($code),
-                        $message ? esc_html($message) : ''
-                    )
-                );
+                return new WP_Error('http_error', sprintf(
+                    __('OpenAI API returned HTTP %d.', 'media-alt-text-enhancer'),
+                    $code
+                ));
             }
 
             $body = wp_remote_retrieve_body($response);
@@ -354,7 +342,7 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             }
 
             $data = json_decode($body, true);
-            if (! is_array($data) || empty($data['choices'][0]['message']['content'])) {
+            if (empty($data['choices'][0]['message']['content'])) {
                 return new WP_Error('invalid_response', __('Unexpected response format from OpenAI API.', 'media-alt-text-enhancer'));
             }
 
@@ -393,9 +381,9 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                                 'text' => __('Describe the contents of this image for alt text purposes.', 'media-alt-text-enhancer'),
                             ],
                             [
-                                'type'      => 'image_url',
-                                'image_url' => [
-                                    'url' => esc_url_raw($image_url),
+                                'type'       => 'image_url',
+                                'image_url'  => [
+                                    'url' => $image_url,
                                 ],
                             ],
                         ],
@@ -413,8 +401,8 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             $length_callback = function_exists('mb_strlen') ? 'mb_strlen' : 'strlen';
             $substr_callback = function_exists('mb_substr') ? 'mb_substr' : 'substr';
 
-            if ($length_callback($text) > self::MAX_ALT_LENGTH) {
-                $text = $substr_callback($text, 0, self::MAX_ALT_LENGTH - 3) . '...';
+            if ($length_callback($text) > 120) {
+                $text = $substr_callback($text, 0, 117) . '...';
             }
 
             return $text;
