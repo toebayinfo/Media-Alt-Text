@@ -94,13 +94,24 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 function (): void {
                     $options = $this->get_settings();
                     $model   = $options['model'] ?? 'gpt-4o-mini';
-                    printf(
-                        '<input type="text" name="%1$s[model]" value="%2$s" class="regular-text" />',
-                        esc_attr(self::OPTION_KEY),
-                        esc_attr($model)
-                    );
+                    $choices = [
+                        'gpt-4o-mini' => __('gpt-4o-mini (default)', 'media-alt-text-enhancer'),
+                        'gpt-4o'      => __('gpt-4o', 'media-alt-text-enhancer'),
+                    ];
+
+                    echo '<select name="' . esc_attr(self::OPTION_KEY) . '[model]" class="regular-text">';
+                    foreach ($choices as $value => $label) {
+                        printf(
+                            '<option value="%1$s" %2$s>%3$s</option>',
+                            esc_attr($value),
+                            selected($model, $value, false),
+                            esc_html($label)
+                        );
+                    }
+                    echo '</select>';
+
                     echo '<p class="description">' . esc_html__(
-                        'Vision-capable model to use when generating alt text (e.g. gpt-4o-mini).',
+                        'Vision-capable model to use when generating alt text. 4o-mini is cheaper & higher throughput.',
                         'media-alt-text-enhancer'
                     ) . '</p>';
                 },
@@ -217,9 +228,12 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 $clean['api_key'] = sanitize_text_field($settings['api_key']);
             }
 
-            $clean['model'] = ! empty($settings['model'])
-                ? sanitize_text_field($settings['model'])
-                : 'gpt-4o-mini';
+            $allowed_models = [ 'gpt-4o-mini', 'gpt-4o' ];
+            $model          = ! empty($settings['model']) ? sanitize_text_field($settings['model']) : 'gpt-4o-mini';
+            if (! in_array($model, $allowed_models, true)) {
+                $model = 'gpt-4o-mini';
+            }
+            $clean['model'] = $model;
 
             $clean['language'] = ! empty($settings['language'])
                 ? sanitize_text_field($settings['language'])
