@@ -19,6 +19,9 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
         private const NONCE_ACTION = 'media_alt_text_enhancer_generate';
         private const FAILED_OPTION_KEY = 'media_alt_text_enhancer_failed_attachments';
 
+        private $api_key = '';
+        private $current_attachment_id = null;
+
         public function __construct()
         {
             add_action('init', [ $this, 'load_textdomain' ]);
@@ -136,6 +139,75 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 'media_alt_text_enhancer',
                 'media_alt_text_enhancer_generation'
             );
+
+            add_settings_field(
+                'media_alt_text_enhancer_batch_size',
+                __('Batch size', 'media-alt-text-enhancer'),
+                function (): void {
+                    $options    = $this->get_settings();
+                    $batch_size = isset($options['mate_batch_size']) ? intval($options['mate_batch_size']) : 10;
+                    printf(
+                        '<input type="number" name="%1$s[mate_batch_size]" value="%2$d" class="small-text" min="1" max="50" step="1" />',
+                        esc_attr(self::OPTION_KEY),
+                        $batch_size
+                    );
+                    echo '<p class="description">' . esc_html__(
+                        'Number of images to process per batch when generating alt text. Must be between 1 and 50.',
+                        'media-alt-text-enhancer'
+                    ) . '</p>';
+                },
+                'media_alt_text_enhancer',
+                'media_alt_text_enhancer_generation'
+            );
+
+            add_settings_field(
+                'media_alt_text_enhancer_delay',
+                __('Delay (ms)', 'media-alt-text-enhancer'),
+                function (): void {
+                    $options  = $this->get_settings();
+                    $delay_ms = isset($options['mate_rate_limit_ms']) ? intval($options['mate_rate_limit_ms']) : 1500;
+                    printf(
+                        '<input type="number" name="%1$s[mate_rate_limit_ms]" value="%2$d" class="small-text" min="0" step="100" />',
+                        esc_attr(self::OPTION_KEY),
+                        $delay_ms
+                    );
+                    echo '<p class="description">' . esc_html__(
+                        'Pause length in milliseconds between requests. Increase the delay to stay within API rate limits.',
+                        'media-alt-text-enhancer'
+                    ) . '</p>';
+                },
+                'media_alt_text_enhancer',
+                'media_alt_text_enhancer_generation'
+            );
+
+            add_settings_field(
+                'media_alt_text_enhancer_replace_mode',
+                __('Replace policy', 'media-alt-text-enhancer'),
+                function (): void {
+                    $options      = $this->get_settings();
+                    $replace_mode = $options['mate_replace_mode'] ?? 'only-missing';
+                    $choices      = [
+                        'only-missing' => __('Only fill missing alt text', 'media-alt-text-enhancer'),
+                        'replace-all'  => __('Replace existing alt text', 'media-alt-text-enhancer'),
+                    ];
+                    echo '<select name="' . esc_attr(self::OPTION_KEY) . '[mate_replace_mode]">';
+                    foreach ($choices as $value => $label) {
+                        printf(
+                            '<option value="%1$s" %2$s>%3$s</option>',
+                            esc_attr($value),
+                            selected($replace_mode, $value, false),
+                            esc_html($label)
+                        );
+                    }
+                    echo '</select>';
+                    echo '<p class="description">' . esc_html__(
+                        'Choose whether to only fill missing alt text or replace all existing alt attributes.',
+                        'media-alt-text-enhancer'
+                    ) . '</p>';
+                },
+                'media_alt_text_enhancer',
+                'media_alt_text_enhancer_generation'
+            );
         }
 
         public function sanitize_settings(array $settings): array
@@ -152,6 +224,20 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             $clean['language'] = ! empty($settings['language'])
                 ? sanitize_text_field($settings['language'])
                 : 'en';
+
+            $batch_size = isset($settings['mate_batch_size']) ? intval($settings['mate_batch_size']) : 10;
+            $batch_size = max(1, min(50, $batch_size));
+            $clean['mate_batch_size'] = $batch_size;
+
+            $delay_ms = isset($settings['mate_rate_limit_ms']) ? intval($settings['mate_rate_limit_ms']) : 1500;
+            $delay_ms = max(0, $delay_ms);
+            $clean['mate_rate_limit_ms'] = $delay_ms;
+
+            $replace_mode = isset($settings['mate_replace_mode']) ? sanitize_text_field($settings['mate_replace_mode']) : 'only-missing';
+            if (! in_array($replace_mode, [ 'only-missing', 'replace-all' ], true)) {
+                $replace_mode = 'only-missing';
+            }
+            $clean['mate_replace_mode'] = $replace_mode;
 
             return $clean;
         }
@@ -262,6 +348,10 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 )
             ) . '</p>';
 
+            if (! empty($results['scan_summary'])) {
+                echo '<p>' . esc_html($results['scan_summary']) . '</p>';
+            }
+
             if (! empty($results['errors'])) {
                 echo '<ul>';
                 foreach ($results['errors'] as $error) {
@@ -288,55 +378,44 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 ];
             }
 
-            $retry_count = 0;
-            if ($resume_failed) {
-                $state       = $this->get_failed_run_state();
-                $attachments = array_map('intval', $state['ids'] ?? []);
+            $batch_size    = isset($settings['mate_batch_size']) ? max(1, min(50, intval($settings['mate_batch_size']))) : 10;
+            $delay_ms      = isset($settings['mate_rate_limit_ms']) ? max(0, intval($settings['mate_rate_limit_ms'])) : 1500;
+            $replace_mode  = $settings['mate_replace_mode'] ?? 'only-missing';
 
-                if (empty($attachments)) {
-                    $this->persist_failed_run_state([], 0);
+            $query_args = [
+                'post_type'      => 'attachment',
+                'post_mime_type' => 'image',
+                'posts_per_page' => -1,
+                'post_status'    => 'inherit',
+                'fields'         => 'ids',
+            ];
 
-                    return [
-                        'updated' => 0,
-                        'skipped' => 0,
-                        'failed'  => 0,
-                        'retried' => intval($state['retries'] ?? 0),
-                        'errors'  => [
-                            __('No failed attachments remain to resume.', 'media-alt-text-enhancer'),
-                        ],
-                    ];
-                }
-
-                $retry_count = intval($state['retries'] ?? 0) + 1;
-            } else {
-                $attachments = get_posts([
-                    'post_type'      => 'attachment',
-                    'post_mime_type' => 'image',
-                    'posts_per_page' => -1,
-                    'post_status'    => 'inherit',
-                    'fields'         => 'ids',
-                    'meta_query'     => [
-                        'relation' => 'OR',
-                        [
-                            'key'     => '_wp_attachment_image_alt',
-                            'compare' => 'NOT EXISTS',
-                        ],
-                        [
-                            'key'     => '_wp_attachment_image_alt',
-                            'value'   => '',
-                            'compare' => '=',
-                        ],
+            if ('replace-all' !== $replace_mode) {
+                $query_args['meta_query'] = [
+                    'relation' => 'OR',
+                    [
+                        'key'     => '_wp_attachment_image_alt',
+                        'compare' => 'NOT EXISTS',
                     ],
-                ]);
+                    [
+                        'key'     => '_wp_attachment_image_alt',
+                        'value'   => '',
+                        'compare' => '=',
+                    ],
+                ];
             }
 
+            $attachments = get_posts($query_args);
+
+            $this->api_key = $settings['api_key'];
+
             $results = [
-                'updated'    => 0,
-                'skipped'    => 0,
-                'failed'     => 0,
-                'errors'     => [],
-                'failed_ids' => [],
-                'retried'    => $retry_count,
+                'updated' => 0,
+                'skipped' => 0,
+                'errors'  => [],
+                'scan_summary' => $only_non_greek
+                    ? __('Scan included images with empty alt text and those whose existing alt text does not contain Greek characters.', 'media-alt-text-enhancer')
+                    : __('Scan included only images missing alt text.', 'media-alt-text-enhancer'),
             ];
 
             if (empty($attachments)) {
@@ -348,10 +427,23 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             }
 
             foreach ($attachments as $attachment_id) {
-                $alt = get_post_meta($attachment_id, '_wp_attachment_image_alt', true);
-                if ('' !== trim((string) $alt)) {
+                $alt_text = trim((string) get_post_meta($attachment_id, '_wp_attachment_image_alt', true));
+
+                if ($only_non_greek) {
+                    if ('' !== $alt_text && $this->contains_greek_characters($alt_text)) {
+                        $results['skipped']++;
+                        continue;
+                    }
+                } elseif ('' !== $alt_text) {
                     $results['skipped']++;
                     continue;
+                }
+
+                $this->current_attachment_id = $attachment_id;
+
+                $rate_limit = $this->rate_limit_ms();
+                if ($rate_limit > 0) {
+                    usleep((int) $rate_limit * 1000);
                 }
 
                 $description = $this->generate_alt_text_for_attachment($attachment_id, $settings);
@@ -383,11 +475,15 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 }
             }
 
-            $this->persist_failed_run_state($results['failed_ids'], $results['failed'] > 0 ? $retry_count : 0);
-
-            unset($results['failed_ids']);
+            $this->api_key = '';
+            $this->current_attachment_id = null;
 
             return $results;
+        }
+
+        private function contains_greek_characters(string $text): bool
+        {
+            return (bool) preg_match('/\p{Greek}/u', $text);
         }
 
         private function generate_alt_text_for_attachment(int $attachment_id, array $settings)
@@ -399,17 +495,7 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
 
             $request_body = $this->build_openai_request_body($image_url, $settings['language'] ?? 'en');
 
-            $response = wp_remote_post(
-                'https://api.openai.com/v1/chat/completions',
-                [
-                    'headers' => [
-                        'Content-Type'  => 'application/json',
-                        'Authorization' => 'Bearer ' . $settings['api_key'],
-                    ],
-                    'body'    => wp_json_encode($request_body),
-                    'timeout' => 60,
-                ]
-            );
+            $response = $this->request_openai_with_retry($request_body, $this->max_retries());
 
             if (is_wp_error($response)) {
                 return $response;
@@ -457,6 +543,176 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             $content = $data['choices'][0]['message']['content'];
 
             return $this->normalize_alt_text($content);
+        }
+
+        private function rate_limit_ms(): int
+        {
+            $default = 1500;
+            $value   = apply_filters('mate_rate_limit_ms', $default);
+
+            if (! is_numeric($value)) {
+                return $default;
+            }
+
+            return max(0, (int) $value);
+        }
+
+        private function max_retries(): int
+        {
+            $default = 6;
+            $value   = apply_filters('mate_max_retries', $default);
+
+            if (! is_numeric($value)) {
+                return $default;
+            }
+
+            $value = (int) $value;
+
+            return $value > 0 ? $value : $default;
+        }
+
+        private function request_openai_with_retry(array $payload, int $max_tries = 6)
+        {
+            if (empty($this->api_key)) {
+                return new WP_Error('missing_api_key', __('OpenAI API key is not configured.', 'media-alt-text-enhancer'));
+            }
+
+            $max_tries = max(1, $max_tries);
+
+            $endpoint = 'https://api.openai.com/v1/chat/completions';
+            $attempt  = 0;
+            $delays   = [0.5, 1, 2, 4, 8];
+
+            while ($attempt < $max_tries) {
+                $attempt++;
+
+                $response = wp_remote_post(
+                    $endpoint,
+                    [
+                        'headers' => [
+                            'Content-Type'  => 'application/json',
+                            'Authorization' => 'Bearer ' . $this->api_key,
+                        ],
+                        'body'    => wp_json_encode($payload),
+                        'timeout' => 60,
+                    ]
+                );
+
+                if (is_wp_error($response)) {
+                    return $response;
+                }
+
+                $code = wp_remote_retrieve_response_code($response);
+                if ($code >= 200 && $code < 300) {
+                    return $response;
+                }
+
+                if ($code !== 429 && ($code < 500 || $code >= 600)) {
+                    return new WP_Error('http_error', sprintf(
+                        __('OpenAI API returned HTTP %d.', 'media-alt-text-enhancer'),
+                        $code
+                    ));
+                }
+
+                if ($attempt >= $max_tries) {
+                    break;
+                }
+
+                $delay = $delays[min($attempt, count($delays)) - 1];
+
+                $retry_after_header = wp_remote_retrieve_header($response, 'retry-after');
+                $retry_after        = $this->parse_retry_after($retry_after_header);
+
+                if (null !== $retry_after) {
+                    $delay = max($delay, $retry_after);
+                }
+
+                $delay *= $this->jitter_multiplier();
+
+                $this->log(
+                    'info',
+                    sprintf(
+                        'Retrying OpenAI request for attachment %1$d after %.2f seconds (attempt %2$d of %3$d).',
+                        $this->current_attachment_id ?? 0,
+                        $delay,
+                        $attempt + 1,
+                        $max_tries
+                    )
+                );
+
+                usleep((int) round($delay * 1000000));
+            }
+
+            $message = __('OpenAI API returned HTTP %d.', 'media-alt-text-enhancer');
+
+            $final_code = isset($code) ? $code : 0;
+
+            $this->log(
+                'warning',
+                sprintf(
+                    'OpenAI request for attachment %1$d failed with HTTP %2$d after %3$d attempts.',
+                    $this->current_attachment_id ?? 0,
+                    $final_code,
+                    $max_tries
+                )
+            );
+
+            return new WP_Error('http_error', sprintf($message, $final_code));
+        }
+
+        private function parse_retry_after($header): ?float
+        {
+            if (empty($header)) {
+                return null;
+            }
+
+            if (is_array($header)) {
+                $header = reset($header);
+            }
+
+            if (is_numeric($header)) {
+                return max(0, (float) $header);
+            }
+
+            $timestamp = strtotime($header);
+
+            if (false === $timestamp) {
+                return null;
+            }
+
+            $diff = $timestamp - time();
+
+            return $diff > 0 ? (float) $diff : null;
+        }
+
+        private function jitter_multiplier(): float
+        {
+            $min = 1000;
+            $max = 1250;
+
+            if (function_exists('wp_rand')) {
+                $random = wp_rand($min, $max);
+            } else {
+                $random = random_int($min, $max);
+            }
+
+            return $random / 1000;
+        }
+
+        private function log(string $level, string $message, array $context = []): void
+        {
+            if (function_exists('wp_get_logger')) {
+                wp_get_logger()->log($level, $message, $context);
+                return;
+            }
+
+            $context_string = '';
+            if (! empty($context)) {
+                $encoded        = function_exists('wp_json_encode') ? wp_json_encode($context) : json_encode($context);
+                $context_string = ' ' . (string) $encoded;
+            }
+
+            error_log(sprintf('[media-alt-text-enhancer][%s] %s%s', strtoupper($level), $message, $context_string));
         }
 
         private function build_openai_request_body(string $image_url, string $language): array
