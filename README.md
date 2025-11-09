@@ -19,3 +19,12 @@ A WordPress plugin that scans your media library for images without alternative 
 After saving your API credentials, press **Generate Alt Text Now** on the plugin page. The plugin will request captions for every image in the Media Library that has an empty alt attribute and update the alt text automatically.
 
 Any issues encountered during generation (for example, network errors or invalid API responses) are displayed once the process completes.
+
+## Releases
+
+Create a new release by tagging the desired commit and pushing the tag:
+
+```bash
+git tag vX.Y.Z
+git push --tags
+```
