@@ -17,6 +17,7 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
     {
         private const OPTION_KEY = 'media_alt_text_enhancer_settings';
         private const NONCE_ACTION = 'media_alt_text_enhancer_generate';
+        private const FAILED_OPTION_KEY = 'media_alt_text_enhancer_failed_attachments';
 
         private $api_key = '';
         private $current_attachment_id = null;
@@ -248,9 +249,14 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             }
 
             $results = null;
+            $failed_state = $this->get_failed_run_state();
+
             if (isset($_POST['media_alt_text_enhancer_generate'])) {
                 check_admin_referer(self::NONCE_ACTION);
-                $results = $this->handle_generation_request();
+                $results = $this->handle_generation_request(false);
+            } elseif (isset($_POST['media_alt_text_enhancer_resume_failed'])) {
+                check_admin_referer(self::NONCE_ACTION);
+                $results = $this->handle_generation_request(true);
             }
 
             echo '<div class="wrap">';
@@ -286,6 +292,38 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             submit_button(__('Generate Alt Text Now', 'media-alt-text-enhancer'), 'primary', 'media_alt_text_enhancer_generate');
             echo '</form>';
 
+            if (! empty($failed_state['ids'])) {
+                $count      = count($failed_state['ids']);
+                $retry_text = isset($failed_state['retries']) ? intval($failed_state['retries']) : 0;
+                $timestamp  = isset($failed_state['timestamp']) ? intval($failed_state['timestamp']) : 0;
+                $last_run   = $timestamp ? date_i18n(
+                    get_option('date_format') . ' ' . get_option('time_format'),
+                    $timestamp
+                ) : '';
+
+                echo '<div class="notice notice-warning">';
+                echo '<p>' . esc_html(
+                    sprintf(
+                        /* translators: 1: number of failed attachments, 2: retry count, 3: last run time */
+                        _n(
+                            'There is %1$d attachment awaiting retry. Attempted %2$d times. Last attempt: %3$s.',
+                            'There are %1$d attachments awaiting retry. Attempted %2$d times. Last attempt: %3$s.',
+                            $count,
+                            'media-alt-text-enhancer'
+                        ),
+                        $count,
+                        $retry_text,
+                        $last_run ? $last_run : __('n/a', 'media-alt-text-enhancer')
+                    )
+                ) . '</p>';
+                echo '</div>';
+
+                printf('<form method="post" style="margin-top: 1em;">');
+                wp_nonce_field(self::NONCE_ACTION);
+                submit_button(__('Resume Failed Only', 'media-alt-text-enhancer'), 'secondary', 'media_alt_text_enhancer_resume_failed');
+                echo '</form>';
+            }
+
             echo '</div>';
         }
 
@@ -301,10 +339,12 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             echo '<div class="' . esc_attr($class) . '">';
             echo '<p>' . esc_html(
                 sprintf(
-                    /* translators: 1: number of updated images, 2: number of skipped images */
-                    __('Updated %1$d images. %2$d images were skipped.', 'media-alt-text-enhancer'),
+                    /* translators: 1: updated count, 2: skipped count, 3: failed count, 4: retry count */
+                    __('Updated %1$d images. Skipped %2$d images. Failed %3$d images. Retried %4$d times.', 'media-alt-text-enhancer'),
                     intval($results['updated'] ?? 0),
-                    intval($results['skipped'] ?? 0)
+                    intval($results['skipped'] ?? 0),
+                    intval($results['failed'] ?? 0),
+                    intval($results['retried'] ?? 0)
                 )
             ) . '</p>';
 
@@ -323,13 +363,15 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             echo '</div>';
         }
 
-        private function handle_generation_request(): array
+        private function handle_generation_request(bool $resume_failed): array
         {
             $settings = $this->get_settings();
             if (empty($settings['api_key'])) {
                 return [
                     'updated' => 0,
                     'skipped' => 0,
+                    'failed'  => 0,
+                    'retried' => 0,
                     'errors'  => [
                         __('Generation skipped because the OpenAI API key is not configured.', 'media-alt-text-enhancer'),
                     ],
@@ -376,6 +418,14 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                     : __('Scan included only images missing alt text.', 'media-alt-text-enhancer'),
             ];
 
+            if (empty($attachments)) {
+                $this->persist_failed_run_state([], 0);
+
+                $results['errors'][] = __('No images found that require alt text generation.', 'media-alt-text-enhancer');
+
+                return $results;
+            }
+
             foreach ($attachments as $attachment_id) {
                 $alt_text = trim((string) get_post_meta($attachment_id, '_wp_attachment_image_alt', true));
 
@@ -399,13 +449,21 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 $description = $this->generate_alt_text_for_attachment($attachment_id, $settings);
 
                 if (is_wp_error($description)) {
-                    $results['errors'][] = sprintf(
+                    $error_message = sprintf(
                         /* translators: 1: attachment ID, 2: error message */
-                        __('Attachment %1$d skipped: %2$s', 'media-alt-text-enhancer'),
+                        __('Attachment %1$d error: %2$s', 'media-alt-text-enhancer'),
                         $attachment_id,
                         $description->get_error_message()
                     );
-                    $results['skipped']++;
+
+                    if ('policy_violation' === $description->get_error_code()) {
+                        $results['skipped']++;
+                    } else {
+                        $results['failed']++;
+                        $results['failed_ids'][] = $attachment_id;
+                    }
+
+                    $results['errors'][] = $error_message;
                     continue;
                 }
 
@@ -445,10 +503,31 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
 
             $code = wp_remote_retrieve_response_code($response);
             if ($code < 200 || $code >= 300) {
-                return new WP_Error('http_error', sprintf(
+                $error_code    = 'http_error';
+                $error_message = sprintf(
                     __('OpenAI API returned HTTP %d.', 'media-alt-text-enhancer'),
                     $code
-                ));
+                );
+
+                $decoded = json_decode($body, true);
+                if (is_array($decoded) && isset($decoded['error'])) {
+                    $api_error = $decoded['error'];
+                    if (! empty($api_error['message'])) {
+                        $error_message = sanitize_text_field($api_error['message']);
+                    }
+
+                    if (! empty($api_error['code'])) {
+                        $error_code = sanitize_key(str_replace('.', '_', $api_error['code']));
+                    } elseif (! empty($api_error['type'])) {
+                        $error_code = sanitize_key(str_replace('.', '_', $api_error['type']));
+                    }
+                }
+
+                if ('content_policy_violation' === $error_code || 'policy_violation' === $error_code) {
+                    $error_code = 'policy_violation';
+                }
+
+                return new WP_Error($error_code, $error_message);
             }
 
             $body = wp_remote_retrieve_body($response);
@@ -701,6 +780,35 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             }
 
             return $settings;
+        }
+
+        private function get_failed_run_state(): array
+        {
+            $state = get_option(self::FAILED_OPTION_KEY, []);
+            if (! is_array($state)) {
+                return [];
+            }
+
+            return $state;
+        }
+
+        private function persist_failed_run_state(array $failed_ids, int $retries): void
+        {
+            $failed_ids = array_values(array_unique(array_map('intval', $failed_ids)));
+
+            if (empty($failed_ids)) {
+                delete_option(self::FAILED_OPTION_KEY);
+                return;
+            }
+
+            update_option(
+                self::FAILED_OPTION_KEY,
+                [
+                    'ids'       => $failed_ids,
+                    'timestamp' => current_time('timestamp'),
+                    'retries'   => max(0, $retries),
+                ]
+            );
         }
     }
 }
