@@ -135,6 +135,28 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 'media_alt_text_enhancer',
                 'media_alt_text_enhancer_generation'
             );
+
+            add_settings_field(
+                'media_alt_text_enhancer_only_non_greek',
+                __('Only regenerate non-Greek alt text', 'media-alt-text-enhancer'),
+                function (): void {
+                    $options          = $this->get_settings();
+                    $only_non_greek   = ! empty($options['mate_only_non_greek']);
+                    $field_name       = sprintf('%s[mate_only_non_greek]', self::OPTION_KEY);
+                    $checkbox         = sprintf(
+                        '<input type="checkbox" name="%1$s" value="1" %2$s />',
+                        esc_attr($field_name),
+                        checked($only_non_greek, true, false)
+                    );
+
+                    echo '<label>' . $checkbox . ' ' . esc_html__(
+                        'Regenerate alt text for images whose current alt text is empty or does not contain Greek characters.',
+                        'media-alt-text-enhancer'
+                    ) . '</label>';
+                },
+                'media_alt_text_enhancer',
+                'media_alt_text_enhancer_generation'
+            );
         }
 
         public function sanitize_settings(array $settings): array
@@ -151,6 +173,8 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             $clean['language'] = ! empty($settings['language'])
                 ? sanitize_text_field($settings['language'])
                 : 'en';
+
+            $clean['mate_only_non_greek'] = ! empty($settings['mate_only_non_greek']) ? 1 : 0;
 
             return $clean;
         }
@@ -222,6 +246,10 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 )
             ) . '</p>';
 
+            if (! empty($results['scan_summary'])) {
+                echo '<p>' . esc_html($results['scan_summary']) . '</p>';
+            }
+
             if (! empty($results['errors'])) {
                 echo '<ul>';
                 foreach ($results['errors'] as $error) {
@@ -246,13 +274,18 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 ];
             }
 
-            $attachments = get_posts([
+            $only_non_greek = ! empty($settings['mate_only_non_greek']);
+
+            $query_args = [
                 'post_type'      => 'attachment',
                 'post_mime_type' => 'image',
                 'posts_per_page' => -1,
                 'post_status'    => 'inherit',
                 'fields'         => 'ids',
-                'meta_query'     => [
+            ];
+
+            if (! $only_non_greek) {
+                $query_args['meta_query'] = [
                     'relation' => 'OR',
                     [
                         'key'     => '_wp_attachment_image_alt',
@@ -263,18 +296,29 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                         'value'   => '',
                         'compare' => '=',
                     ],
-                ],
-            ]);
+                ];
+            }
+
+            $attachments = get_posts($query_args);
 
             $results = [
                 'updated' => 0,
                 'skipped' => 0,
                 'errors'  => [],
+                'scan_summary' => $only_non_greek
+                    ? __('Scan included images with empty alt text and those whose existing alt text does not contain Greek characters.', 'media-alt-text-enhancer')
+                    : __('Scan included only images missing alt text.', 'media-alt-text-enhancer'),
             ];
 
             foreach ($attachments as $attachment_id) {
-                $alt = get_post_meta($attachment_id, '_wp_attachment_image_alt', true);
-                if ('' !== trim((string) $alt)) {
+                $alt_text = trim((string) get_post_meta($attachment_id, '_wp_attachment_image_alt', true));
+
+                if ($only_non_greek) {
+                    if ('' !== $alt_text && $this->contains_greek_characters($alt_text)) {
+                        $results['skipped']++;
+                        continue;
+                    }
+                } elseif ('' !== $alt_text) {
                     $results['skipped']++;
                     continue;
                 }
@@ -301,6 +345,11 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             }
 
             return $results;
+        }
+
+        private function contains_greek_characters(string $text): bool
+        {
+            return (bool) preg_match('/\p{Greek}/u', $text);
         }
 
         private function generate_alt_text_for_attachment(int $attachment_id, array $settings)
