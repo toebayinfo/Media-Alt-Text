@@ -18,6 +18,9 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
         private const OPTION_KEY = 'media_alt_text_enhancer_settings';
         private const NONCE_ACTION = 'media_alt_text_enhancer_generate';
 
+        private $api_key = '';
+        private $current_attachment_id = null;
+
         public function __construct()
         {
             add_action('init', [ $this, 'load_textdomain' ]);
@@ -358,51 +361,51 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
 
             $attachments = get_posts($query_args);
 
+            $this->api_key = $settings['api_key'];
+
             $results = [
                 'updated' => 0,
                 'skipped' => 0,
                 'errors'  => [],
             ];
 
-            $chunks = array_chunk($attachments, $batch_size);
-            $chunk_count = count($chunks);
+            foreach ($attachments as $attachment_id) {
+                $alt = get_post_meta($attachment_id, '_wp_attachment_image_alt', true);
+                if ('' !== trim((string) $alt)) {
+                    $results['skipped']++;
+                    continue;
+                }
 
-            foreach ($chunks as $chunk_index => $chunk) {
-                foreach ($chunk as $item_index => $attachment_id) {
-                    if ('only-missing' === $replace_mode) {
-                        $alt = get_post_meta($attachment_id, '_wp_attachment_image_alt', true);
-                        if ('' !== trim((string) $alt)) {
-                            $results['skipped']++;
-                            continue;
-                        }
-                    }
+                $this->current_attachment_id = $attachment_id;
 
-                    $description = $this->generate_alt_text_for_attachment($attachment_id, $settings);
+                $rate_limit = $this->rate_limit_ms();
+                if ($rate_limit > 0) {
+                    usleep((int) $rate_limit * 1000);
+                }
 
-                    if (is_wp_error($description)) {
-                        $results['errors'][] = sprintf(
-                            /* translators: 1: attachment ID, 2: error message */
-                            __('Attachment %1$d skipped: %2$s', 'media-alt-text-enhancer'),
-                            $attachment_id,
-                            $description->get_error_message()
-                        );
-                        $results['skipped']++;
-                    } elseif ($description) {
-                        update_post_meta($attachment_id, '_wp_attachment_image_alt', wp_strip_all_tags($description));
-                        $results['updated']++;
-                    } else {
-                        $results['skipped']++;
-                    }
+                $description = $this->generate_alt_text_for_attachment($attachment_id, $settings);
 
-                    $is_last_in_batch = $item_index === count($chunk) - 1;
-                    $is_last_batch    = $chunk_index === $chunk_count - 1;
-                    if (! $is_last_batch || ! $is_last_in_batch) {
-                        if ($delay_ms > 0) {
-                            usleep($delay_ms * 1000);
-                        }
-                    }
+                if (is_wp_error($description)) {
+                    $results['errors'][] = sprintf(
+                        /* translators: 1: attachment ID, 2: error message */
+                        __('Attachment %1$d skipped: %2$s', 'media-alt-text-enhancer'),
+                        $attachment_id,
+                        $description->get_error_message()
+                    );
+                    $results['skipped']++;
+                    continue;
+                }
+
+                if ($description) {
+                    update_post_meta($attachment_id, '_wp_attachment_image_alt', wp_strip_all_tags($description));
+                    $results['updated']++;
+                } else {
+                    $results['skipped']++;
                 }
             }
+
+            $this->api_key = '';
+            $this->current_attachment_id = null;
 
             return $results;
         }
@@ -416,17 +419,7 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
 
             $request_body = $this->build_openai_request_body($image_url, $settings['language'] ?? 'en');
 
-            $response = wp_remote_post(
-                'https://api.openai.com/v1/chat/completions',
-                [
-                    'headers' => [
-                        'Content-Type'  => 'application/json',
-                        'Authorization' => 'Bearer ' . $settings['api_key'],
-                    ],
-                    'body'    => wp_json_encode($request_body),
-                    'timeout' => 60,
-                ]
-            );
+            $response = $this->request_openai_with_retry($request_body, $this->max_retries());
 
             if (is_wp_error($response)) {
                 return $response;
@@ -453,6 +446,176 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             $content = $data['choices'][0]['message']['content'];
 
             return $this->normalize_alt_text($content);
+        }
+
+        private function rate_limit_ms(): int
+        {
+            $default = 1500;
+            $value   = apply_filters('mate_rate_limit_ms', $default);
+
+            if (! is_numeric($value)) {
+                return $default;
+            }
+
+            return max(0, (int) $value);
+        }
+
+        private function max_retries(): int
+        {
+            $default = 6;
+            $value   = apply_filters('mate_max_retries', $default);
+
+            if (! is_numeric($value)) {
+                return $default;
+            }
+
+            $value = (int) $value;
+
+            return $value > 0 ? $value : $default;
+        }
+
+        private function request_openai_with_retry(array $payload, int $max_tries = 6)
+        {
+            if (empty($this->api_key)) {
+                return new WP_Error('missing_api_key', __('OpenAI API key is not configured.', 'media-alt-text-enhancer'));
+            }
+
+            $max_tries = max(1, $max_tries);
+
+            $endpoint = 'https://api.openai.com/v1/chat/completions';
+            $attempt  = 0;
+            $delays   = [0.5, 1, 2, 4, 8];
+
+            while ($attempt < $max_tries) {
+                $attempt++;
+
+                $response = wp_remote_post(
+                    $endpoint,
+                    [
+                        'headers' => [
+                            'Content-Type'  => 'application/json',
+                            'Authorization' => 'Bearer ' . $this->api_key,
+                        ],
+                        'body'    => wp_json_encode($payload),
+                        'timeout' => 60,
+                    ]
+                );
+
+                if (is_wp_error($response)) {
+                    return $response;
+                }
+
+                $code = wp_remote_retrieve_response_code($response);
+                if ($code >= 200 && $code < 300) {
+                    return $response;
+                }
+
+                if ($code !== 429 && ($code < 500 || $code >= 600)) {
+                    return new WP_Error('http_error', sprintf(
+                        __('OpenAI API returned HTTP %d.', 'media-alt-text-enhancer'),
+                        $code
+                    ));
+                }
+
+                if ($attempt >= $max_tries) {
+                    break;
+                }
+
+                $delay = $delays[min($attempt, count($delays)) - 1];
+
+                $retry_after_header = wp_remote_retrieve_header($response, 'retry-after');
+                $retry_after        = $this->parse_retry_after($retry_after_header);
+
+                if (null !== $retry_after) {
+                    $delay = max($delay, $retry_after);
+                }
+
+                $delay *= $this->jitter_multiplier();
+
+                $this->log(
+                    'info',
+                    sprintf(
+                        'Retrying OpenAI request for attachment %1$d after %.2f seconds (attempt %2$d of %3$d).',
+                        $this->current_attachment_id ?? 0,
+                        $delay,
+                        $attempt + 1,
+                        $max_tries
+                    )
+                );
+
+                usleep((int) round($delay * 1000000));
+            }
+
+            $message = __('OpenAI API returned HTTP %d.', 'media-alt-text-enhancer');
+
+            $final_code = isset($code) ? $code : 0;
+
+            $this->log(
+                'warning',
+                sprintf(
+                    'OpenAI request for attachment %1$d failed with HTTP %2$d after %3$d attempts.',
+                    $this->current_attachment_id ?? 0,
+                    $final_code,
+                    $max_tries
+                )
+            );
+
+            return new WP_Error('http_error', sprintf($message, $final_code));
+        }
+
+        private function parse_retry_after($header): ?float
+        {
+            if (empty($header)) {
+                return null;
+            }
+
+            if (is_array($header)) {
+                $header = reset($header);
+            }
+
+            if (is_numeric($header)) {
+                return max(0, (float) $header);
+            }
+
+            $timestamp = strtotime($header);
+
+            if (false === $timestamp) {
+                return null;
+            }
+
+            $diff = $timestamp - time();
+
+            return $diff > 0 ? (float) $diff : null;
+        }
+
+        private function jitter_multiplier(): float
+        {
+            $min = 1000;
+            $max = 1250;
+
+            if (function_exists('wp_rand')) {
+                $random = wp_rand($min, $max);
+            } else {
+                $random = random_int($min, $max);
+            }
+
+            return $random / 1000;
+        }
+
+        private function log(string $level, string $message, array $context = []): void
+        {
+            if (function_exists('wp_get_logger')) {
+                wp_get_logger()->log($level, $message, $context);
+                return;
+            }
+
+            $context_string = '';
+            if (! empty($context)) {
+                $encoded        = function_exists('wp_json_encode') ? wp_json_encode($context) : json_encode($context);
+                $context_string = ' ' . (string) $encoded;
+            }
+
+            error_log(sprintf('[media-alt-text-enhancer][%s] %s%s', strtoupper($level), $message, $context_string));
         }
 
         private function build_openai_request_body(string $image_url, string $language): array
