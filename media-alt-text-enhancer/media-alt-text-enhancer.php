@@ -308,6 +308,10 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 )
             ) . '</p>';
 
+            if (! empty($results['scan_summary'])) {
+                echo '<p>' . esc_html($results['scan_summary']) . '</p>';
+            }
+
             if (! empty($results['errors'])) {
                 echo '<ul>';
                 foreach ($results['errors'] as $error) {
@@ -367,11 +371,20 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 'updated' => 0,
                 'skipped' => 0,
                 'errors'  => [],
+                'scan_summary' => $only_non_greek
+                    ? __('Scan included images with empty alt text and those whose existing alt text does not contain Greek characters.', 'media-alt-text-enhancer')
+                    : __('Scan included only images missing alt text.', 'media-alt-text-enhancer'),
             ];
 
             foreach ($attachments as $attachment_id) {
-                $alt = get_post_meta($attachment_id, '_wp_attachment_image_alt', true);
-                if ('' !== trim((string) $alt)) {
+                $alt_text = trim((string) get_post_meta($attachment_id, '_wp_attachment_image_alt', true));
+
+                if ($only_non_greek) {
+                    if ('' !== $alt_text && $this->contains_greek_characters($alt_text)) {
+                        $results['skipped']++;
+                        continue;
+                    }
+                } elseif ('' !== $alt_text) {
                     $results['skipped']++;
                     continue;
                 }
@@ -408,6 +421,11 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             $this->current_attachment_id = null;
 
             return $results;
+        }
+
+        private function contains_greek_characters(string $text): bool
+        {
+            return (bool) preg_match('/\p{Greek}/u', $text);
         }
 
         private function generate_alt_text_for_attachment(int $attachment_id, array $settings)
