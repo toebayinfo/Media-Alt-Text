@@ -138,6 +138,75 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 'media_alt_text_enhancer',
                 'media_alt_text_enhancer_generation'
             );
+
+            add_settings_field(
+                'media_alt_text_enhancer_batch_size',
+                __('Batch size', 'media-alt-text-enhancer'),
+                function (): void {
+                    $options    = $this->get_settings();
+                    $batch_size = isset($options['mate_batch_size']) ? intval($options['mate_batch_size']) : 10;
+                    printf(
+                        '<input type="number" name="%1$s[mate_batch_size]" value="%2$d" class="small-text" min="1" max="50" step="1" />',
+                        esc_attr(self::OPTION_KEY),
+                        $batch_size
+                    );
+                    echo '<p class="description">' . esc_html__(
+                        'Number of images to process per batch when generating alt text. Must be between 1 and 50.',
+                        'media-alt-text-enhancer'
+                    ) . '</p>';
+                },
+                'media_alt_text_enhancer',
+                'media_alt_text_enhancer_generation'
+            );
+
+            add_settings_field(
+                'media_alt_text_enhancer_delay',
+                __('Delay (ms)', 'media-alt-text-enhancer'),
+                function (): void {
+                    $options  = $this->get_settings();
+                    $delay_ms = isset($options['mate_rate_limit_ms']) ? intval($options['mate_rate_limit_ms']) : 1500;
+                    printf(
+                        '<input type="number" name="%1$s[mate_rate_limit_ms]" value="%2$d" class="small-text" min="0" step="100" />',
+                        esc_attr(self::OPTION_KEY),
+                        $delay_ms
+                    );
+                    echo '<p class="description">' . esc_html__(
+                        'Pause length in milliseconds between requests. Increase the delay to stay within API rate limits.',
+                        'media-alt-text-enhancer'
+                    ) . '</p>';
+                },
+                'media_alt_text_enhancer',
+                'media_alt_text_enhancer_generation'
+            );
+
+            add_settings_field(
+                'media_alt_text_enhancer_replace_mode',
+                __('Replace policy', 'media-alt-text-enhancer'),
+                function (): void {
+                    $options      = $this->get_settings();
+                    $replace_mode = $options['mate_replace_mode'] ?? 'only-missing';
+                    $choices      = [
+                        'only-missing' => __('Only fill missing alt text', 'media-alt-text-enhancer'),
+                        'replace-all'  => __('Replace existing alt text', 'media-alt-text-enhancer'),
+                    ];
+                    echo '<select name="' . esc_attr(self::OPTION_KEY) . '[mate_replace_mode]">';
+                    foreach ($choices as $value => $label) {
+                        printf(
+                            '<option value="%1$s" %2$s>%3$s</option>',
+                            esc_attr($value),
+                            selected($replace_mode, $value, false),
+                            esc_html($label)
+                        );
+                    }
+                    echo '</select>';
+                    echo '<p class="description">' . esc_html__(
+                        'Choose whether to only fill missing alt text or replace all existing alt attributes.',
+                        'media-alt-text-enhancer'
+                    ) . '</p>';
+                },
+                'media_alt_text_enhancer',
+                'media_alt_text_enhancer_generation'
+            );
         }
 
         public function sanitize_settings(array $settings): array
@@ -154,6 +223,20 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
             $clean['language'] = ! empty($settings['language'])
                 ? sanitize_text_field($settings['language'])
                 : 'en';
+
+            $batch_size = isset($settings['mate_batch_size']) ? intval($settings['mate_batch_size']) : 10;
+            $batch_size = max(1, min(50, $batch_size));
+            $clean['mate_batch_size'] = $batch_size;
+
+            $delay_ms = isset($settings['mate_rate_limit_ms']) ? intval($settings['mate_rate_limit_ms']) : 1500;
+            $delay_ms = max(0, $delay_ms);
+            $clean['mate_rate_limit_ms'] = $delay_ms;
+
+            $replace_mode = isset($settings['mate_replace_mode']) ? sanitize_text_field($settings['mate_replace_mode']) : 'only-missing';
+            if (! in_array($replace_mode, [ 'only-missing', 'replace-all' ], true)) {
+                $replace_mode = 'only-missing';
+            }
+            $clean['mate_replace_mode'] = $replace_mode;
 
             return $clean;
         }
@@ -249,13 +332,20 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                 ];
             }
 
-            $attachments = get_posts([
+            $batch_size    = isset($settings['mate_batch_size']) ? max(1, min(50, intval($settings['mate_batch_size']))) : 10;
+            $delay_ms      = isset($settings['mate_rate_limit_ms']) ? max(0, intval($settings['mate_rate_limit_ms'])) : 1500;
+            $replace_mode  = $settings['mate_replace_mode'] ?? 'only-missing';
+
+            $query_args = [
                 'post_type'      => 'attachment',
                 'post_mime_type' => 'image',
                 'posts_per_page' => -1,
                 'post_status'    => 'inherit',
                 'fields'         => 'ids',
-                'meta_query'     => [
+            ];
+
+            if ('replace-all' !== $replace_mode) {
+                $query_args['meta_query'] = [
                     'relation' => 'OR',
                     [
                         'key'     => '_wp_attachment_image_alt',
@@ -266,8 +356,10 @@ if (! class_exists('Media_Alt_Text_Enhancer')) {
                         'value'   => '',
                         'compare' => '=',
                     ],
-                ],
-            ]);
+                ];
+            }
+
+            $attachments = get_posts($query_args);
 
             $this->api_key = $settings['api_key'];
 
